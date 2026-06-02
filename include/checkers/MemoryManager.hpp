@@ -41,6 +41,14 @@
 
 namespace checkers {
 
+inline void device_synchronize() {
+#if defined(RAJA_ENABLE_HIP)
+    (void)hipDeviceSynchronize();
+#elif defined(RAJA_ENABLE_CUDA)
+    (void)cudaDeviceSynchronize();
+#endif
+}
+
 // ------------------------------------------------------------------ //
 //  Device-side metadata record
 //  Mirrors TensorMetadata for tensors that are laid out on the GPU so

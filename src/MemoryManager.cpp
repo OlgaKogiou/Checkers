@@ -16,18 +16,6 @@
 
 namespace checkers {
 
-namespace {
-
-void device_synchronize() {
-#if defined(RAJA_ENABLE_HIP)
-    (void)hipDeviceSynchronize();
-#elif defined(RAJA_ENABLE_CUDA)
-    (void)cudaDeviceSynchronize();
-#endif
-}
-
-} // namespace
-
 MemoryManager::MemoryManager() 
     : rm_(umpire::ResourceManager::getInstance()),
       device_allocator_(rm_.getAllocator("DEVICE")),

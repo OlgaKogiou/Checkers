@@ -427,17 +427,32 @@ size_t discover_zero3_flat_states(py::object optimizer,
                                   std::vector<py::object>& lifetime_guard,
                                   size_t& skipped_tensors) {
     // ------------------------------------------------------------------
-    // One-time setup: collect the fp32 flat group list and the optimizer
-    // state dict (keyed by fp32 flat tensors -> {"exp_avg": ..., ...}).
-    // The state dict is only non-empty after at least one real optimizer
-    // step has been executed (i.e., after gradient_accumulation_steps
-    // backward calls have been made).
+    // GLOBAL FLAT VIEW
+    //
+    // ZeRO-3 avoids replication by assigning each rank responsibility for
+    // a contiguous slice of the globally-concatenated parameter space.
+    // We compute cumulative ds_numel offsets for every parameter and only
+    // track those whose logical range overlaps with this rank's slice:
+    //
+    //   rank_start = global_rank * flat_group.numel()
+    //   rank_end   = (global_rank + 1) * flat_group.numel()
+    //
+    // For overlapping parameters we use the grad_position offsets to
+    // access the rank's actual local shard in the flat buffer, so the
+    // data is always physically correct. Different ranks will therefore
+    // track different sets of parameters, matching the on-disk checkpoint
+    // sharding structure.
     // ------------------------------------------------------------------
-    py::list fp32_groups;
-    if (py::hasattr(optimizer, "fp32_partitioned_groups_flat")) {
-        fp32_groups = py_list_func(optimizer.attr("fp32_partitioned_groups_flat"));
-    }
 
+    // Collect flat buffer groups
+    py::list fp32_groups, fp16_groups;
+    if (py::hasattr(optimizer, "fp32_partitioned_groups_flat"))
+        fp32_groups = py_list_func(optimizer.attr("fp32_partitioned_groups_flat"));
+    if (py::hasattr(optimizer, "fp16_partitioned_groups_flat"))
+        fp16_groups = py_list_func(optimizer.attr("fp16_partitioned_groups_flat"));
+
+    // Optimizer state dict (keyed by fp32 flat tensors -> {"exp_avg": ..., ...}).
+    // Non-empty only after at least one real optimizer step.
     py::dict optimizer_state_dict;
     bool has_opt_state = false;
     if (py::hasattr(optimizer, "optimizer")) {
@@ -446,7 +461,7 @@ size_t discover_zero3_flat_states(py::object optimizer,
             py::object raw_state = base_opt.attr("state");
             if (!raw_state.is_none() && py::isinstance<py::dict>(raw_state)) {
                 optimizer_state_dict = raw_state.cast<py::dict>();
-                has_opt_state = (optimizer_state_dict.size() > 0);
+                has_opt_state = !optimizer_state_dict.empty();
             }
         }
     }
@@ -457,118 +472,195 @@ size_t discover_zero3_flat_states(py::object optimizer,
     if (logger) {
         logger->log_message("[checkers][zero3] fp32_groups="
             + std::to_string(fp32_groups.size())
+            + " fp16_groups=" + std::to_string(fp16_groups.size())
             + " optimizer_state_entries=" + std::to_string(optimizer_state_dict.size())
             + " has_grad_position=" + (has_grad_pos ? "true" : "false"));
     }
 
+    const size_t num_groups = fp32_groups.size();
+    if (num_groups == 0) return 0;
+
+    // ------------------------------------------------------------------
+    // Build per-group param info sorted by flat_offset so we can walk
+    // them in order and accumulate the cumulative ds_numel global offset.
+    // ------------------------------------------------------------------
+    struct ParamInfo {
+        std::string name;
+        py::object  param;
+        size_t      group_idx;
+        size_t      flat_offset;  // grad_position offset (partition_numel-based)
+        size_t      flat_numel;   // partition_numel (elements in this rank's flat buffer)
+        size_t      ds_numel;     // full logical element count for this parameter
+    };
+    std::vector<std::vector<ParamInfo>> group_params(num_groups);
+
+    if (has_grad_pos) {
+        for (auto item : named_params) {
+            auto tuple_item = item.cast<py::tuple>();
+            const std::string pname = tuple_item[0].cast<std::string>();
+            py::object param = tuple_item[1];
+
+            if (!py::hasattr(param, "requires_grad")
+                || !param.attr("requires_grad").cast<bool>()
+                || !py::hasattr(param, "ds_numel")) {
+                continue;
+            }
+            try {
+                py::object param_id = optimizer.attr("get_param_id")(param);
+                py::object loc_obj  = optimizer.attr("grad_position").attr("get")(param_id, py::none());
+                if (loc_obj.is_none()) continue;
+
+                py::list loc = py_list_func(loc_obj);
+                const size_t gidx   = py::reinterpret_borrow<py::object>(loc[0]).cast<size_t>();
+                const size_t foff   = py::reinterpret_borrow<py::object>(loc[1]).cast<size_t>();
+                const size_t fnumel = py::reinterpret_borrow<py::object>(loc[2]).cast<size_t>();
+                const size_t dsn    = param.attr("ds_numel").cast<size_t>();
+
+                if (gidx < num_groups && fnumel > 0 && dsn > 0)
+                    group_params[gidx].push_back({pname, param, gidx, foff, fnumel, dsn});
+            } catch (...) {}
+        }
+        // Sort each group's params by their position inside the flat buffer
+        for (auto& params : group_params) {
+            std::sort(params.begin(), params.end(),
+                [](const ParamInfo& a, const ParamInfo& b) {
+                    return a.flat_offset < b.flat_offset;
+                });
+        }
+    }
+
     size_t discovered = 0;
+    std::vector<std::string> tracked_names;  // for per-rank logging
 
-    for (auto item : named_params) {
-        auto tuple_item = item.cast<py::tuple>();
-        const std::string param_name = tuple_item[0].cast<std::string>();
-        py::object param = tuple_item[1];
-        size_t discovered_for_param = 0;
+    for (size_t g = 0; g < num_groups; ++g) {
+        if (g >= fp32_groups.size() || group_params[g].empty()) continue;
 
-        // ---- MODEL STATE: param.ds_tensor is this rank's local bf16 shard ----
-        if (py::hasattr(param, "ds_tensor") && !param.attr("ds_tensor").is_none()) {
-            py::object ds_tensor = param.attr("ds_tensor");
-            const auto disc_start = std::chrono::steady_clock::now();
-            TensorExtraction extraction;
-            if (try_zero_partitioned_tensor(param, ds_tensor, global_rank,
-                                            py_list_func, extraction)) {
-                apply_logical_metadata(param, extraction.meta, py_list_func);
-                lifetime_guard.push_back(ds_tensor);
-                const double disc_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - disc_start).count();
-                if (submit_extraction(mgr, param_name, TensorCategory::ModelState,
-                                      extraction, histogram_bins, disc_ms)) {
-                    ++discovered;
-                    ++discovered_for_param;
+        py::object fp32_flat = py::reinterpret_borrow<py::object>(fp32_groups[g]);
+        const size_t flat_size = fp32_flat.attr("numel")().cast<size_t>();
+        if (flat_size == 0) continue;
+
+        // Total logical elements in this group (sum of ds_numel, not partition_numel)
+        size_t total_ds_numel = 0;
+        for (const auto& p : group_params[g]) total_ds_numel += p.ds_numel;
+
+        // This rank's contiguous territory in the global ds_numel space
+        const size_t rank_start = static_cast<size_t>(global_rank) * flat_size;
+        const size_t rank_end   = std::min(
+            (static_cast<size_t>(global_rank) + 1) * flat_size,
+            total_ds_numel);
+
+        // bf16 flat buffer for model state (same layout as fp32, different dtype)
+        py::object fp16_flat = py::none();
+        if (g < fp16_groups.size())
+            fp16_flat = py::reinterpret_borrow<py::object>(fp16_groups[g]);
+
+        // Optimizer state tensors for this group
+        py::object exp_avg_flat = py::none(), exp_avg_sq_flat = py::none();
+        if (has_opt_state && optimizer_state_dict.contains(fp32_flat)) {
+            py::dict st = optimizer_state_dict[fp32_flat].cast<py::dict>();
+            const py::str ea_key("exp_avg"), easq_key("exp_avg_sq");
+            if (st.contains(ea_key))   exp_avg_flat   = st[ea_key];
+            if (st.contains(easq_key)) exp_avg_sq_flat = st[easq_key];
+        }
+
+        // Walk params in flat-buffer order, accumulating global ds_numel offset
+        size_t global_ds_offset = 0;
+        for (const auto& pinfo : group_params[g]) {
+            const size_t p_start = global_ds_offset;
+            const size_t p_end   = global_ds_offset + pinfo.ds_numel;
+            global_ds_offset    += pinfo.ds_numel;
+
+            // Skip parameters outside this rank's global territory
+            if (p_end <= rank_start || p_start >= rank_end) {
+                ++skipped_tensors;
+                continue;
+            }
+
+            // Use grad_position offsets for the actual flat buffer data access.
+            // This gives the rank's own physical shard of the parameter.
+            const size_t dest_offset  = pinfo.flat_offset;
+            const size_t num_elements = pinfo.flat_numel;
+            size_t n_for_param = 0;
+
+            // Model state (bf16): prefer fp16_partitioned_groups_flat, fall back to ds_tensor
+            if (!fp16_flat.is_none()) {
+                if (submit_partition_slice(fp16_flat, pinfo.param,
+                                           pinfo.name,
+                                           "zero3.fp16_partitioned_groups_flat",
+                                           TensorCategory::ModelState,
+                                           dest_offset, num_elements,
+                                           py_list_func, histogram_bins, mgr,
+                                           lifetime_guard)) {
+                    ++discovered; ++n_for_param;
+                    tracked_names.push_back(pinfo.name);
+                }
+            } else if (py::hasattr(pinfo.param, "ds_tensor")
+                       && !pinfo.param.attr("ds_tensor").is_none()) {
+                py::object ds_t = pinfo.param.attr("ds_tensor");
+                const auto t0 = std::chrono::steady_clock::now();
+                TensorExtraction ext;
+                if (try_zero_partitioned_tensor(pinfo.param, ds_t, global_rank,
+                                                py_list_func, ext)) {
+                    apply_logical_metadata(pinfo.param, ext.meta, py_list_func);
+                    lifetime_guard.push_back(ds_t);
+                    const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    if (submit_extraction(mgr, pinfo.name, TensorCategory::ModelState,
+                                          ext, histogram_bins, ms)) {
+                        ++discovered; ++n_for_param;
+                        tracked_names.push_back(pinfo.name);
+                    }
                 }
             }
-        }
 
-        // ---- MASTER WEIGHTS + OPTIMIZER STATES via grad_position ----
-        // grad_position maps param_id -> [group_idx, dest_offset, num_elements]
-        // and tells us exactly where each parameter lives inside the flat fp32 buffer.
-        if (!has_grad_pos
-            || !py::hasattr(param, "requires_grad")
-            || !param.attr("requires_grad").cast<bool>()) {
-            if (discovered_for_param == 0) ++skipped_tensors;
-            continue;
-        }
-
-        try {
-            py::object param_id = optimizer.attr("get_param_id")(param);
-            py::object grad_pos_obj = optimizer.attr("grad_position");
-            py::object location_obj = grad_pos_obj.attr("get")(param_id, py::none());
-            if (location_obj.is_none()) {
-                if (discovered_for_param == 0) ++skipped_tensors;
-                continue;
-            }
-
-            py::list loc = py_list_func(location_obj);
-            const size_t group_idx    = py::reinterpret_borrow<py::object>(loc[0]).cast<size_t>();
-            const size_t dest_offset  = py::reinterpret_borrow<py::object>(loc[1]).cast<size_t>();
-            const size_t num_elements = py::reinterpret_borrow<py::object>(loc[2]).cast<size_t>();
-
-            if (group_idx >= fp32_groups.size() || num_elements == 0) {
-                if (discovered_for_param == 0) ++skipped_tensors;
-                continue;
-            }
-
-            py::object fp32_flat = py::reinterpret_borrow<py::object>(fp32_groups[group_idx]);
-
-            // Master weights (fp32 slice of the flat buffer for this param)
-            if (submit_partition_slice(fp32_flat, param,
-                                       "master_weights::" + param_name,
+            // Master weights (fp32 shard)
+            if (submit_partition_slice(fp32_flat, pinfo.param,
+                                       "master_weights::" + pinfo.name,
                                        "zero3.fp32_partitioned_groups_flat",
                                        TensorCategory::MasterWeights,
                                        dest_offset, num_elements,
                                        py_list_func, histogram_bins, mgr,
                                        lifetime_guard)) {
-                ++discovered;
-                ++discovered_for_param;
+                ++discovered; ++n_for_param;
             }
 
             // Optimizer states – only available after the first real optimizer step
-            if (has_opt_state && optimizer_state_dict.contains(fp32_flat)) {
-                py::dict state_entry = optimizer_state_dict[fp32_flat].cast<py::dict>();
-
-                const py::str exp_avg_key("exp_avg");
-                const py::str exp_avg_sq_key("exp_avg_sq");
-
-                if (state_entry.contains(exp_avg_key)) {
-                    if (submit_partition_slice(state_entry[exp_avg_key], param,
-                                               "optimizer.exp_avg::" + param_name,
-                                               "zero3.optimizer.exp_avg",
-                                               TensorCategory::OptimizerExpAvg,
-                                               dest_offset, num_elements,
-                                               py_list_func, histogram_bins, mgr,
-                                               lifetime_guard)) {
-                        ++discovered;
-                        ++discovered_for_param;
-                    }
-                }
-
-                if (state_entry.contains(exp_avg_sq_key)) {
-                    if (submit_partition_slice(state_entry[exp_avg_sq_key], param,
-                                               "optimizer.exp_avg_sq::" + param_name,
-                                               "zero3.optimizer.exp_avg_sq",
-                                               TensorCategory::OptimizerExpAvgSq,
-                                               dest_offset, num_elements,
-                                               py_list_func, histogram_bins, mgr,
-                                               lifetime_guard)) {
-                        ++discovered;
-                        ++discovered_for_param;
-                    }
+            if (has_opt_state && !exp_avg_flat.is_none()) {
+                if (submit_partition_slice(exp_avg_flat, pinfo.param,
+                                           "optimizer.exp_avg::" + pinfo.name,
+                                           "zero3.optimizer.exp_avg",
+                                           TensorCategory::OptimizerExpAvg,
+                                           dest_offset, num_elements,
+                                           py_list_func, histogram_bins, mgr,
+                                           lifetime_guard)) {
+                    ++discovered; ++n_for_param;
                 }
             }
-        } catch (...) {
-            // param not registered in grad_position (e.g. non-trainable / persistent)
-        }
+            if (has_opt_state && !exp_avg_sq_flat.is_none()) {
+                if (submit_partition_slice(exp_avg_sq_flat, pinfo.param,
+                                           "optimizer.exp_avg_sq::" + pinfo.name,
+                                           "zero3.optimizer.exp_avg_sq",
+                                           TensorCategory::OptimizerExpAvgSq,
+                                           dest_offset, num_elements,
+                                           py_list_func, histogram_bins, mgr,
+                                           lifetime_guard)) {
+                    ++discovered; ++n_for_param;
+                }
+            }
 
-        if (discovered_for_param == 0) ++skipped_tensors;
+            if (n_for_param == 0) ++skipped_tensors;
+        }
+    }
+
+    // Log the tensor names tracked on this rank so operators can verify
+    // that different ranks are tracking different parameter sets.
+    if (logger) {
+        std::string msg = "[checkers][zero3][rank_tensors] rank="
+            + std::to_string(global_rank)
+            + " count=" + std::to_string(tracked_names.size());
+        for (const auto& n : tracked_names)
+            msg += "\n  " + n;
+        logger->log_message(msg);
     }
 
     return discovered;
